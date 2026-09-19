@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  yemennet-dsl-bot:
+    build: .
+    container_name: yemennet_dsl_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
