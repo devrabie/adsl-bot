@@ -15,6 +15,12 @@ class Line(Base):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # Subscriber info
+    subscriber_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    package_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    device_uid: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    session_cookies: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # Scraped cache fields
     total_gb: Mapped[float] = mapped_column(Float, default=0.0)
     used_gb: Mapped[float] = mapped_column(Float, default=0.0)

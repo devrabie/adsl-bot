@@ -9,6 +9,8 @@ def test_generate_dsl_report_excel(tmp_path):
         {
             "id": 1,
             "phone_number": "01234567",
+            "subscriber_name": "أحمد علي",
+            "package_name": "سوبر نت",
             "total_gb": 100.0,
             "used_gb": 92.0,
             "remaining_gb": 8.0,
@@ -21,6 +23,8 @@ def test_generate_dsl_report_excel(tmp_path):
         {
             "id": 2,
             "phone_number": "01765432",
+            "subscriber_name": "محمد سالم",
+            "package_name": "سوبر نت 2",
             "total_gb": 200.0,
             "used_gb": 160.0,
             "remaining_gb": 40.0,
@@ -39,4 +43,5 @@ def test_generate_dsl_report_excel(tmp_path):
     sheet = wb.active
     assert sheet.views.sheetView[0].rightToLeft is True
     assert sheet.cell(row=4, column=2).value == "01234567"
-    assert sheet.cell(row=4, column=5).value == 8.0
+    assert sheet.cell(row=4, column=3).value == "أحمد علي"
+    assert sheet.cell(row=4, column=7).value == 8.0

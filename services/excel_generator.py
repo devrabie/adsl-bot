@@ -53,7 +53,7 @@ def generate_dsl_report_excel(lines_data: List[Dict[str, Any]], filepath: str) -
     border_thin = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
 
     # Title Row
-    ws.merge_cells("A1:I1")
+    ws.merge_cells("A1:K1")
     title_cell = ws["A1"]
     title_cell.value = f"تقرير مراقبة خطوط الإنترنت - يمن نت ({datetime.date.today().strftime('%Y-%m-%d')})"
     title_cell.font = font_title
@@ -63,9 +63,11 @@ def generate_dsl_report_excel(lines_data: List[Dict[str, Any]], filepath: str) -
 
     # Headers
     headers = [
-        "معرف الخط (ID)",
+        "معرف الخط",
         "رقم الخط",
-        "الرصيد الإجمالي (GB)",
+        "اسم المشترك",
+        "الباقة",
+        "الرصيد الكلي (GB)",
         "المستهلك (GB)",
         "المتبقي (GB)",
         "استهلاك 24 ساعة (GB)",
@@ -103,6 +105,8 @@ def generate_dsl_report_excel(lines_data: List[Dict[str, Any]], filepath: str) -
         row_values = [
             data.get("id"),
             data.get("phone_number"),
+            data.get("subscriber_name") or "-",
+            data.get("package_name") or "-",
             data.get("total_gb", 0.0),
             data.get("used_gb", 0.0),
             rem_gb,
@@ -133,19 +137,19 @@ def generate_dsl_report_excel(lines_data: List[Dict[str, Any]], filepath: str) -
     summary_row = start_row + len(lines_data) + 1
     ws.row_dimensions[summary_row].height = 26
 
-    ws.merge_cells(start_row=summary_row, start_column=1, end_row=summary_row, end_column=4)
+    ws.merge_cells(start_row=summary_row, start_column=1, end_row=summary_row, end_column=6)
     sum_label_cell = ws.cell(row=summary_row, column=1)
     sum_label_cell.value = f"الإجمالي الكلي ({len(lines_data)} خطوط):"
     sum_label_cell.font = font_summary
     sum_label_cell.fill = fill_summary
     sum_label_cell.alignment = align_right
 
-    for c in range(1, 5):
+    for c in range(1, 7):
         ws.cell(row=summary_row, column=c).fill = fill_summary
         ws.cell(row=summary_row, column=c).border = border_thin
 
     # Total Remaining GB cell
-    cell_rem_sum = ws.cell(row=summary_row, column=5)
+    cell_rem_sum = ws.cell(row=summary_row, column=7)
     cell_rem_sum.value = round(total_remaining_sum, 2)
     cell_rem_sum.font = font_summary
     cell_rem_sum.fill = fill_summary
@@ -153,14 +157,14 @@ def generate_dsl_report_excel(lines_data: List[Dict[str, Any]], filepath: str) -
     cell_rem_sum.border = border_thin
 
     # Total 24h Consumption cell
-    cell_24h_sum = ws.cell(row=summary_row, column=6)
+    cell_24h_sum = ws.cell(row=summary_row, column=8)
     cell_24h_sum.value = round(total_24h_sum, 2)
     cell_24h_sum.font = font_summary
     cell_24h_sum.fill = fill_summary
     cell_24h_sum.alignment = align_center
     cell_24h_sum.border = border_thin
 
-    for c in range(7, 10):
+    for c in range(9, 12):
         cell_empty = ws.cell(row=summary_row, column=c)
         cell_empty.fill = fill_summary
         cell_empty.border = border_thin

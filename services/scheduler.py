@@ -1,4 +1,5 @@
 import os
+import tempfile
 import logging
 import datetime
 import pytz
@@ -13,7 +14,7 @@ from core.config import settings
 from core.db import async_session
 from core.models import Line, Snapshot
 from core.security import decrypt_password
-from services.scraper import YemenNetScraper
+from services.scraper import YemenNetScraper, CaptchaRequiredError
 from services.excel_generator import generate_dsl_report_excel
 from bot.handlers.main_handler import build_line_status_text, calculate_24h_consumption
 
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 async def run_daily_report_job(bot: Bot):
     """
     Daily scheduled job (e.g. 21:00 Aden time):
-    1. Scrapes all active lines.
+    1. Scrapes all active lines using saved session cookies.
     2. Computes 24h net consumption comparing with prior snapshot.
     3. Saves new daily balance snapshot.
     4. Generates dual report: HTML Telegram message + Excel file.
@@ -48,8 +49,16 @@ async def run_daily_report_job(bot: Bot):
         for line in lines:
             try:
                 raw_pass = decrypt_password(line.encrypted_password)
-                data = await scraper.fetch_account_data(line.phone_number, raw_pass)
+                data, updated_cookies = await scraper.fetch_account_data(
+                    line.phone_number,
+                    raw_pass,
+                    session_cookies=line.session_cookies,
+                    device_uid=line.device_uid
+                )
 
+                line.subscriber_name = data.get("subscriber_name") or line.subscriber_name
+                line.package_name = data.get("package_name") or line.package_name
+                line.session_cookies = updated_cookies
                 line.total_gb = data["total_gb"]
                 line.used_gb = data["used_gb"]
                 line.remaining_gb = data["remaining_gb"]
@@ -57,6 +66,9 @@ async def run_daily_report_job(bot: Bot):
                 line.days_left = data["days_left"]
                 line.last_scraped_at = datetime.datetime.utcnow()
                 line.last_error = None
+            except CaptchaRequiredError:
+                line.last_error = "انتهت الجلسة، يلزم تجديد الكباتشا من البوت"
+                logger.warning(f"Session expired for line {line.phone_number}, needs captcha.")
             except Exception as e:
                 line.last_error = str(e)
                 logger.error(f"Error scraping line {line.phone_number} in daily job: {e}")
@@ -64,16 +76,17 @@ async def run_daily_report_job(bot: Bot):
             # Calculate 24h consumption BEFORE adding new snapshot to session
             net_24h = await calculate_24h_consumption(session, line.id, line.remaining_gb)
 
-            # Create daily Snapshot
-            snap = Snapshot(
-                line_id=line.id,
-                total_gb=line.total_gb,
-                used_gb=line.used_gb,
-                remaining_gb=line.remaining_gb,
-                days_left=line.days_left,
-                created_at=datetime.datetime.utcnow()
-            )
-            session.add(snap)
+            # Create daily Snapshot if no error or if we have valid data
+            if not line.last_error or line.remaining_gb > 0:
+                snap = Snapshot(
+                    line_id=line.id,
+                    total_gb=line.total_gb,
+                    used_gb=line.used_gb,
+                    remaining_gb=line.remaining_gb,
+                    days_left=line.days_left,
+                    created_at=datetime.datetime.utcnow()
+                )
+                session.add(snap)
 
             msg_lines.append(build_line_status_text(line, net_24h))
 
@@ -89,6 +102,8 @@ async def run_daily_report_job(bot: Bot):
             report_data_for_excel.append({
                 "id": line.id,
                 "phone_number": line.phone_number,
+                "subscriber_name": line.subscriber_name,
+                "package_name": line.package_name,
                 "total_gb": line.total_gb,
                 "used_gb": line.used_gb,
                 "remaining_gb": line.remaining_gb,
@@ -103,7 +118,7 @@ async def run_daily_report_job(bot: Bot):
 
         # Build Excel report
         filename = f"daily_dsl_report_{datetime.date.today().strftime('%Y_%m_%d')}.xlsx"
-        filepath = os.path.join("/tmp", filename)
+        filepath = os.path.join(tempfile.gettempdir(), filename)
         generate_dsl_report_excel(report_data_for_excel, filepath)
 
         full_message_text = (
@@ -132,12 +147,15 @@ async def run_daily_report_job(bot: Bot):
                 logger.error(f"Failed sending daily report to admin {admin_id}: {admin_err}")
 
         if os.path.exists(filepath):
-            os.remove(filepath)
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
 
 async def run_periodic_check_job(bot: Bot):
     """
     Fast periodic check job (e.g. every X hours):
-    1. Scrapes all active lines.
+    1. Scrapes all active lines using saved session cookies.
     2. Compares against custom alert thresholds.
     3. Sends Instant Alerts for 50GB, 10GB, 10 days, 5 days with deduplication (alert_sent flags).
     4. Auto-resets alert_sent flags when recharged above thresholds.
@@ -153,8 +171,16 @@ async def run_periodic_check_job(bot: Bot):
         for line in lines:
             try:
                 raw_pass = decrypt_password(line.encrypted_password)
-                data = await scraper.fetch_account_data(line.phone_number, raw_pass)
+                data, updated_cookies = await scraper.fetch_account_data(
+                    line.phone_number,
+                    raw_pass,
+                    session_cookies=line.session_cookies,
+                    device_uid=line.device_uid
+                )
 
+                line.subscriber_name = data.get("subscriber_name") or line.subscriber_name
+                line.package_name = data.get("package_name") or line.package_name
+                line.session_cookies = updated_cookies
                 line.total_gb = data["total_gb"]
                 line.used_gb = data["used_gb"]
                 line.remaining_gb = data["remaining_gb"]
@@ -162,19 +188,37 @@ async def run_periodic_check_job(bot: Bot):
                 line.days_left = data["days_left"]
                 line.last_scraped_at = datetime.datetime.utcnow()
                 line.last_error = None
+            except CaptchaRequiredError:
+                line.last_error = "انتهت الجلسة، يلزم تجديد الكباتشا من البوت"
+                # Send notice to admin once
+                if not getattr(line, "alert_session_expired", False):
+                    for admin_id in settings.admins_list:
+                        try:
+                            await bot.send_message(
+                                chat_id=admin_id,
+                                text=(
+                                    f"⚠️ <b>تنبيه: انتهت جلسة الخط {line.phone_number}!</b>\n"
+                                    f"يرجى الدخول للبوت وتجديد الجلسة عبر حل الكباتشا لاستمرار المراقبة التلقائية."
+                                ),
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+                continue
             except Exception as e:
                 line.last_error = str(e)
                 continue
 
             alerts_to_send = []
+            sub_info = f" ({line.subscriber_name})" if line.subscriber_name else ""
 
             # Check Critical GB Threshold (e.g. < 10GB)
             if line.remaining_gb <= line.gb_threshold_critical:
                 if not line.alert_10gb_sent:
                     alerts_to_send.append(
                         f"🚨 <b>تنبيه حرج (الرصيد منخفض جداً)!</b>\n"
-                        f"الخط {line.id} ({line.phone_number})\n"
-                        f"الرصيد المتبقي وصلت إلى <b>{line.remaining_gb} GB</b> (أقل من {line.gb_threshold_critical} GB)."
+                        f"الخط {line.id} ({line.phone_number}){sub_info}\n"
+                        f"الرصيد المتبقي وصل إلى <b>{line.remaining_gb:.2f} GB</b> (أقل من {line.gb_threshold_critical} GB)."
                     )
                     line.alert_10gb_sent = True
                     line.alert_50gb_sent = True
@@ -183,8 +227,8 @@ async def run_periodic_check_job(bot: Bot):
                 if not line.alert_50gb_sent:
                     alerts_to_send.append(
                         f"⚠️ <b>تنبيه تحذيري (انخفاض الرصيد)!</b>\n"
-                        f"الخط {line.id} ({line.phone_number})\n"
-                        f"الرصيد المتبقي وصلت إلى <b>{line.remaining_gb} GB</b> (أقل من {line.gb_threshold_warning} GB)."
+                        f"الخط {line.id} ({line.phone_number}){sub_info}\n"
+                        f"الرصيد المتبقي وصل إلى <b>{line.remaining_gb:.2f} GB</b> (أقل من {line.gb_threshold_warning} GB)."
                     )
                     line.alert_50gb_sent = True
             else:
@@ -197,7 +241,7 @@ async def run_periodic_check_job(bot: Bot):
                 if not line.alert_5days_sent:
                     alerts_to_send.append(
                         f"🚨 <b>تنبيه حرج (اقتراب انتهاء الصلاحية)!</b>\n"
-                        f"الخط {line.id} ({line.phone_number})\n"
+                        f"الخط {line.id} ({line.phone_number}){sub_info}\n"
                         f"الأيام المتبقية وصلت إلى <b>{line.days_left} يوم</b> (أقل من {line.days_threshold_critical} أيام)."
                     )
                     line.alert_5days_sent = True
@@ -207,7 +251,7 @@ async def run_periodic_check_job(bot: Bot):
                 if not line.alert_10days_sent:
                     alerts_to_send.append(
                         f"⚠️ <b>تنبيه تحذيري (اقتراب انتهاء الصلاحية)!</b>\n"
-                        f"الخط {line.id} ({line.phone_number})\n"
+                        f"الخط {line.id} ({line.phone_number}){sub_info}\n"
                         f"الأيام المتبقية وصلت إلى <b>{line.days_left} يوم</b> (أقل من {line.days_threshold_warning} أيام)."
                     )
                     line.alert_10days_sent = True

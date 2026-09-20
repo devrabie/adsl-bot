@@ -1,10 +1,11 @@
 import os
+import tempfile
 import logging
 import datetime
 from typing import List
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.db import async_session
 from core.models import Line, Snapshot
 from core.security import encrypt_password, decrypt_password
-from services.scraper import YemenNetScraper, ScraperError
+from services.scraper import YemenNetScraper, ScraperError, CaptchaRequiredError
 from services.excel_generator import generate_dsl_report_excel
 from bot.keyboards.main_kb import (
     main_dashboard_kb,
@@ -22,14 +23,17 @@ from bot.keyboards.main_kb import (
     line_delete_confirm_kb,
     back_to_main_kb
 )
-from bot.states.line_states import AddLineSG, EditLineThresholdSG
+from bot.states.line_states import AddLineSG, EditLineThresholdSG, ReauthLineSG
 
 router = Router()
 logger = logging.getLogger(__name__)
 
 def build_line_status_text(line: Line, net_24h: float = 0.0) -> str:
+    name_str = f" - {line.subscriber_name}" if line.subscriber_name else ""
+    pkg_str = f"   ├ 📦 الباقة: <b>{line.package_name}</b>\n" if line.package_name else ""
+
     if line.last_error:
-        return f"🔴 <b>الخط {line.id} ({line.phone_number})</b>\n   └ ⚠️ <i>خطأ: {line.last_error}</i>"
+        return f"🔴 <b>الخط {line.id} ({line.phone_number}){name_str}</b>\n{pkg_str}   └ ⚠️ <i>خطأ: {line.last_error}</i>"
 
     status_icon = "🟢"
     status_label = "مستقر"
@@ -41,7 +45,8 @@ def build_line_status_text(line: Line, net_24h: float = 0.0) -> str:
         status_label = "تنبيه"
 
     return (
-        f"{status_icon} <b>الخط {line.id} ({line.phone_number})</b> - [{status_label}]\n"
+        f"{status_icon} <b>الخط {line.id} ({line.phone_number}){name_str}</b> - [{status_label}]\n"
+        f"{pkg_str}"
         f"   ├ 💳 الرصيد المتبقي: <b>{line.remaining_gb:.2f} GB</b> / {line.total_gb:.2f} GB\n"
         f"   ├ 📉 مستهلك 24 ساعة: <b>{net_24h:.2f} GB</b>\n"
         f"   ├ 📅 تاريخ الانتهاء: <b>{line.expiry_date}</b> ({line.days_left} يوم متبقي)\n"
@@ -79,7 +84,7 @@ async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "btn_cancel_fsm")
 async def cb_cancel_fsm(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("❌ تم إلغاء العملية.", reply_markup=back_to_main_kb())
+    await callback.message.answer("❌ تم إلغاء العملية.", reply_markup=back_to_main_kb())
     await callback.answer()
 
 # --- Instant Report ---
@@ -140,6 +145,8 @@ async def cb_export_excel(callback: CallbackQuery):
             export_data.append({
                 "id": line.id,
                 "phone_number": line.phone_number,
+                "subscriber_name": line.subscriber_name,
+                "package_name": line.package_name,
                 "total_gb": line.total_gb,
                 "used_gb": line.used_gb,
                 "remaining_gb": line.remaining_gb,
@@ -151,7 +158,7 @@ async def cb_export_excel(callback: CallbackQuery):
             })
 
         filename = f"dsl_report_{datetime.date.today().strftime('%Y_%m_%d')}.xlsx"
-        filepath = os.path.join("/tmp", filename)
+        filepath = os.path.join(tempfile.gettempdir(), filename)
         generate_dsl_report_excel(export_data, filepath)
 
         excel_file = FSInputFile(filepath, filename=filename)
@@ -161,7 +168,10 @@ async def cb_export_excel(callback: CallbackQuery):
             parse_mode="HTML"
         )
         if os.path.exists(filepath):
-            os.remove(filepath)
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
 
 # --- Sync All Lines ---
 @router.callback_query(F.data == "btn_sync_all")
@@ -180,12 +190,21 @@ async def cb_sync_all(callback: CallbackQuery):
 
         updated_count = 0
         error_count = 0
+        expired_lines = []
 
         for line in lines:
             try:
                 raw_password = decrypt_password(line.encrypted_password)
-                data = await scraper.fetch_account_data(line.phone_number, raw_password)
+                data, updated_cookies = await scraper.fetch_account_data(
+                    line.phone_number,
+                    raw_password,
+                    session_cookies=line.session_cookies,
+                    device_uid=line.device_uid
+                )
 
+                line.subscriber_name = data.get("subscriber_name") or line.subscriber_name
+                line.package_name = data.get("package_name") or line.package_name
+                line.session_cookies = updated_cookies
                 line.total_gb = data["total_gb"]
                 line.used_gb = data["used_gb"]
                 line.remaining_gb = data["remaining_gb"]
@@ -207,16 +226,25 @@ async def cb_sync_all(callback: CallbackQuery):
                     line.alert_5days_sent = False
 
                 updated_count += 1
+            except CaptchaRequiredError:
+                line.last_error = "انتهت الجلسة، يلزم تجديد الكباتشا"
+                expired_lines.append(line.phone_number)
+                error_count += 1
             except Exception as e:
                 line.last_error = str(e)
                 error_count += 1
 
         await session.commit()
 
+    reauth_tip = ""
+    if expired_lines:
+        reauth_tip = f"\n⚠️ خطوط بحاجة لتجديد الكباتشا: {', '.join(expired_lines)} (استخدم 'إدارة الخطوط' لتجديدها)."
+
     await callback.message.answer(
         f"✅ <b>اكتمال التحديث:</b>\n"
         f"├ 🟢 تم تحديث: {updated_count} خط بنجاح\n"
-        f"└ 🔴 تعثر تحديث: {error_count} خط",
+        f"└ 🔴 تعثر تحديث: {error_count} خط"
+        f"{reauth_tip}",
         parse_mode="HTML",
         reply_markup=main_dashboard_kb()
     )
@@ -278,8 +306,16 @@ async def cb_line_sync(callback: CallbackQuery):
 
         try:
             raw_password = decrypt_password(line.encrypted_password)
-            data = await scraper.fetch_account_data(line.phone_number, raw_password)
+            data, updated_cookies = await scraper.fetch_account_data(
+                line.phone_number,
+                raw_password,
+                session_cookies=line.session_cookies,
+                device_uid=line.device_uid
+            )
 
+            line.subscriber_name = data.get("subscriber_name") or line.subscriber_name
+            line.package_name = data.get("package_name") or line.package_name
+            line.session_cookies = updated_cookies
             line.total_gb = data["total_gb"]
             line.used_gb = data["used_gb"]
             line.remaining_gb = data["remaining_gb"]
@@ -289,11 +325,127 @@ async def cb_line_sync(callback: CallbackQuery):
             line.last_error = None
 
             await session.commit()
-            await callback.message.answer(f"✅ تم تحديث بيانات الخط ({line.phone_number}) بنجاح!")
+            await callback.message.answer(
+                f"✅ <b>تم تحديث بيانات الخط ({line.phone_number}) بنجاح!</b>\n\n"
+                f"👤 المشترك: <b>{line.subscriber_name or '-'}</b>\n"
+                f"📦 الباقة: <b>{line.package_name or '-'}</b>\n"
+                f"💳 الرصيد: <b>{line.remaining_gb} GB</b> / {line.total_gb} GB\n"
+                f"📅 الصلاحية: <b>{line.days_left} يوم</b>",
+                parse_mode="HTML"
+            )
+        except CaptchaRequiredError:
+            line.last_error = "انتهت الجلسة، يرجى تجديد الكباتشا"
+            await session.commit()
+            await callback.message.answer(
+                f"⚠️ <b>انتهت جلسة الخط ({line.phone_number})</b>\n\n"
+                "يرجى الضغط على زر '🔐 تجديد الجلسة' لحل الكباتشا وتجديد جلسة الخط تلقائياً.",
+                reply_markup=line_details_kb(line.id),
+                parse_mode="HTML"
+            )
         except Exception as e:
             line.last_error = str(e)
             await session.commit()
             await callback.message.answer(f"❌ تعثر تحديث الخط ({line.phone_number}): {e}")
+
+# --- Re-authenticate Line Session (Captcha) ---
+@router.callback_query(F.data.startswith("line_reauth:"))
+async def cb_line_reauth(callback: CallbackQuery, state: FSMContext):
+    line_id = int(callback.data.split(":")[1])
+    async with async_session() as session:
+        line = await session.get(Line, line_id)
+        if not line:
+            await callback.answer("⚠️ الخط غير موجود.", show_alert=True)
+            return
+        phone = line.phone_number
+        password = decrypt_password(line.encrypted_password)
+        uid = line.device_uid
+
+    await callback.answer("⏳ جاري جلب كود التحقق...")
+    scraper = YemenNetScraper()
+    try:
+        session_state, captcha_bytes = await scraper.initiate_login(phone, password, uid)
+        await state.set_state(ReauthLineSG.waiting_for_captcha)
+        await state.update_data(
+            reauth_line_id=line_id,
+            phone_number=phone,
+            password=password,
+            session_state=session_state
+        )
+        captcha_file = BufferedInputFile(captcha_bytes, filename="captcha.png")
+        await callback.message.answer_photo(
+            photo=captcha_file,
+            caption=(
+                f"🔐 <b>تجديد جلسة الخط {line_id} ({phone})</b>\n\n"
+                "أدخل الأرقام الـ 5 الظاهرة في الصورة لتجديد الجلسة وحفظها:"
+            ),
+            reply_markup=cancel_fsm_kb(show_refresh_captcha=True),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await callback.message.answer(f"❌ تعذر بدء تجديد الجلسة: {e}", reply_markup=back_to_main_kb())
+
+@router.message(ReauthLineSG.waiting_for_captcha)
+async def process_reauth_captcha(message: Message, state: FSMContext):
+    captcha_code = message.text.strip()
+    fsm_data = await state.get_data()
+    line_id = fsm_data.get("reauth_line_id")
+    phone_number = fsm_data.get("phone_number")
+    password = fsm_data.get("password")
+    session_state = fsm_data.get("session_state")
+
+    if not line_id or not session_state:
+        await state.clear()
+        await message.answer("⚠️ انتهت صلاحية الطلب. يرجى إعادة المحاولة.", reply_markup=main_dashboard_kb())
+        return
+
+    wait_msg = await message.answer("⏳ جاري التحقق من الرمز وتجديد الجلسة...")
+    scraper = YemenNetScraper()
+    try:
+        data, updated_cookies = await scraper.finalize_login(
+            session_state=session_state,
+            phone_number=phone_number,
+            password=password,
+            captcha_code=captcha_code
+        )
+        async with async_session() as session:
+            line = await session.get(Line, line_id)
+            if line:
+                line.subscriber_name = data.get("subscriber_name") or line.subscriber_name
+                line.package_name = data.get("package_name") or line.package_name
+                line.device_uid = session_state.get("uid")
+                line.session_cookies = updated_cookies
+                line.total_gb = data["total_gb"]
+                line.used_gb = data["used_gb"]
+                line.remaining_gb = data["remaining_gb"]
+                line.expiry_date = data["expiry_date"]
+                line.days_left = data["days_left"]
+                line.last_scraped_at = datetime.datetime.utcnow()
+                line.last_error = None
+                await session.commit()
+
+        await state.clear()
+        await wait_msg.edit_text(
+            f"🎉 <b>تم تجديد جلسة الخط {line_id} بنجاح!</b>\n\n"
+            f"👤 المشترك: <b>{data.get('subscriber_name', '-')}</b>\n"
+            f"💳 الرصيد: <b>{data['remaining_gb']} GB</b> / {data['total_gb']} GB\n"
+            f"📅 الصلاحية: <b>{data['days_left']} يوم</b>",
+            reply_markup=main_dashboard_kb(),
+            parse_mode="HTML"
+        )
+    except ScraperError as e:
+        try:
+            new_session_state, new_captcha_bytes = await scraper.initiate_login(phone_number, password, session_state.get("uid"))
+            await state.update_data(session_state=new_session_state)
+            await wait_msg.delete()
+            captcha_file = BufferedInputFile(new_captcha_bytes, filename="captcha.png")
+            await message.answer_photo(
+                photo=captcha_file,
+                caption=f"⚠️ {str(e)}\n\nيرجى إدخال الأرقام الظاهرة في الصورة الجديدة:",
+                reply_markup=cancel_fsm_kb(show_refresh_captcha=True),
+                parse_mode="HTML"
+            )
+        except Exception:
+            await wait_msg.edit_text(f"❌ فشل تجديد الجلسة: {e}", reply_markup=cancel_fsm_kb(), parse_mode="HTML")
 
 # --- Line Threshold Customization Flow ---
 @router.callback_query(F.data.startswith("line_thresholds:"))
@@ -373,15 +525,15 @@ async def cb_add_line_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddLineSG.waiting_for_phone)
     text = (
         "➕ <b>إضافة خط جديد</b>\n\n"
-        "الرجاء إدخال رقم الهاتف الثابت الخاص بفرع الإنترنت (مثال: 01234567):"
+        "الرجاء إدخال رقم الهاتف الثابت الخاص باشتراك الإنترنت (مثال: 249590):"
     )
     await callback.message.edit_text(text, reply_markup=cancel_fsm_kb(), parse_mode="HTML")
 
 @router.message(AddLineSG.waiting_for_phone)
 async def process_add_phone(message: Message, state: FSMContext):
     phone_number = message.text.strip()
-    if not phone_number.isdigit() or len(phone_number) < 6:
-        await message.answer("⚠️ رقم الخط غير صحيح. يرجى إدخال رقم هاتف ثابت صحيح (أرقام فقط):", reply_markup=cancel_fsm_kb())
+    if not phone_number.isdigit() or len(phone_number) < 5:
+        await message.answer("⚠️ رقم الخط غير صحيح. يرجى إدخال أرقام فقط:", reply_markup=cancel_fsm_kb())
         return
 
     async with async_session() as session:
@@ -401,16 +553,68 @@ async def process_add_password(message: Message, state: FSMContext):
     fsm_data = await state.get_data()
     phone_number = fsm_data["phone_number"]
 
-    wait_msg = await message.answer("⏳ جاري القيام بفحص تجريبي فوري للتحقق من صحة رقم الخط وكلمة السر مع بوابة يمن نت...")
+    wait_msg = await message.answer("⏳ جاري جلب رمز التحقق (كباتشا) من بوابة يمن نت...")
 
     scraper = YemenNetScraper()
     try:
-        data = await scraper.fetch_account_data(phone_number, password)
+        session_state, captcha_bytes = await scraper.initiate_login(phone_number, password)
+        await state.update_data(
+            phone_number=phone_number,
+            password=password,
+            session_state=session_state
+        )
+        await state.set_state(AddLineSG.waiting_for_captcha)
+        await wait_msg.delete()
+
+        captcha_file = BufferedInputFile(captcha_bytes, filename="captcha.png")
+        await message.answer_photo(
+            photo=captcha_file,
+            caption=(
+                "🔢 <b>رمز التحقق من الصورة (Captcha)</b>\n\n"
+                f"رقم الخط: <code>{phone_number}</code>\n"
+                "يرجى كتابة الأرقام الـ 5 الظاهرة في الصورة أعلاه لتسجيل الدخول وحفظ الجلسة تلقائياً:"
+            ),
+            reply_markup=cancel_fsm_kb(show_refresh_captcha=True),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await wait_msg.edit_text(
+            f"❌ <b>تعذر جلب رمز التحقق:</b>\n{str(e)}\n\nتأكد من الاتصال أو حاول لاحقاً.",
+            reply_markup=cancel_fsm_kb(),
+            parse_mode="HTML"
+        )
+
+@router.message(AddLineSG.waiting_for_captcha)
+async def process_add_captcha(message: Message, state: FSMContext):
+    captcha_code = message.text.strip()
+    fsm_data = await state.get_data()
+    phone_number = fsm_data.get("phone_number")
+    password = fsm_data.get("password")
+    session_state = fsm_data.get("session_state")
+
+    if not phone_number or not password or not session_state:
+        await state.clear()
+        await message.answer("⚠️ انتهت صلاحية الجلسة، يرجى إعادة إضافة الخط.", reply_markup=main_dashboard_kb())
+        return
+
+    wait_msg = await message.answer("⏳ جاري التحقق وتسجيل الدخول...")
+    scraper = YemenNetScraper()
+    try:
+        data, updated_cookies = await scraper.finalize_login(
+            session_state=session_state,
+            phone_number=phone_number,
+            password=password,
+            captcha_code=captcha_code
+        )
         enc_pass = encrypt_password(password)
         async with async_session() as session:
             new_line = Line(
                 phone_number=phone_number,
                 encrypted_password=enc_pass,
+                subscriber_name=data.get("subscriber_name"),
+                package_name=data.get("package_name"),
+                device_uid=session_state.get("uid"),
+                session_cookies=updated_cookies,
                 total_gb=data["total_gb"],
                 used_gb=data["used_gb"],
                 remaining_gb=data["remaining_gb"],
@@ -434,23 +638,67 @@ async def process_add_password(message: Message, state: FSMContext):
             await session.commit()
 
             assigned_id = new_line.id
+            sub_name = new_line.subscriber_name or "المشترك"
 
         await state.clear()
         await wait_msg.edit_text(
             f"🎉 <b>تم حفظ واختبار الخط بنجاح!</b>\n\n"
-            f"📌 تم تعيين المعرف للخط تلقائياً: <b>الخط {assigned_id}</b> ({phone_number})\n"
-            f"💳 الرصيد المتبقي: {data['remaining_gb']} GB\n"
-            f"📅 الصلاحية: {data['days_left']} يوم",
+            f"👤 المشترك: <b>{sub_name}</b>\n"
+            f"📌 المعرف: <b>الخط {assigned_id}</b> ({phone_number})\n"
+            f"📦 الباقة: <b>{data.get('package_name', '-')}</b>\n"
+            f"💳 الرصيد المتبقي: <b>{data['remaining_gb']} GB</b> / {data['total_gb']} GB\n"
+            f"📅 الصلاحية: <b>{data['days_left']} يوم</b> (حتى {data['expiry_date']})\n\n"
+            f"✅ تم تفعيل ميزة 'تذكرني' لتحديث الرصيد دورياً بدون طلب كباتشا مجدداً.",
             reply_markup=main_dashboard_kb(),
             parse_mode="HTML"
         )
     except ScraperError as e:
-        await wait_msg.edit_text(
-            f"❌ <b>فشل الفحص التجريبي:</b>\n{str(e)}\n\n"
-            f"تأكد من صحة رقم الخط وكلمة المرور وحاول مرة أخرى.",
-            reply_markup=cancel_fsm_kb(),
+        try:
+            new_session_state, new_captcha_bytes = await scraper.initiate_login(phone_number, password, session_state.get("uid"))
+            await state.update_data(session_state=new_session_state)
+            await wait_msg.delete()
+            captcha_file = BufferedInputFile(new_captcha_bytes, filename="captcha.png")
+            await message.answer_photo(
+                photo=captcha_file,
+                caption=(
+                    f"⚠️ <b>{str(e)}</b>\n\n"
+                    f"تم توليد رمز تحقق جديد، يرجى كتابة الأرقام الـ 5 الظاهرة في الصورة:"
+                ),
+                reply_markup=cancel_fsm_kb(show_refresh_captcha=True),
+                parse_mode="HTML"
+            )
+        except Exception:
+            await wait_msg.edit_text(
+                f"❌ <b>فشل تسجيل الدخول:</b>\n{str(e)}",
+                reply_markup=cancel_fsm_kb(),
+                parse_mode="HTML"
+            )
+
+@router.callback_query(F.data == "btn_refresh_captcha")
+async def cb_refresh_captcha(callback: CallbackQuery, state: FSMContext):
+    fsm_data = await state.get_data()
+    phone_number = fsm_data.get("phone_number")
+    password = fsm_data.get("password")
+    uid = fsm_data.get("session_state", {}).get("uid")
+
+    if not phone_number or not password:
+        await callback.answer("⚠️ الجلسة منتهية، يرجى البدء من جديد.", show_alert=True)
+        return
+
+    await callback.answer("🔄 جاري تجديد الكباتشا...")
+    scraper = YemenNetScraper()
+    try:
+        new_session_state, new_captcha_bytes = await scraper.initiate_login(phone_number, password, uid)
+        await state.update_data(session_state=new_session_state)
+        captcha_file = BufferedInputFile(new_captcha_bytes, filename="captcha.png")
+        await callback.message.answer_photo(
+            photo=captcha_file,
+            caption="🔢 <b>رمز كباتشا جديد:</b>\nيرجى كتابة الأرقام الـ 5:",
+            reply_markup=cancel_fsm_kb(show_refresh_captcha=True),
             parse_mode="HTML"
         )
+    except Exception as e:
+        await callback.message.answer(f"❌ تعذر تجديد الكباتشا: {e}")
 
 # --- Delete Line Flow ---
 @router.callback_query(F.data.startswith("line_delete_confirm:"))

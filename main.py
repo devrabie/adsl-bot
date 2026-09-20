@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import datetime
 from aiogram import Bot, Dispatcher
@@ -7,6 +8,11 @@ from core.db import init_db
 from bot.middlewares.whitelist import WhitelistMiddleware
 from bot.handlers.main_handler import router as main_router
 from services.scheduler import setup_scheduler
+
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 async def main():
     print("🚀 Starting Yemen Net DSL Monitor Bot...")

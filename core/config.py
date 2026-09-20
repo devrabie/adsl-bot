@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     TIMEZONE: str = "Asia/Aden"
     CHECK_INTERVAL_HOURS: int = 4
     DATABASE_URL: str = "sqlite+aiosqlite:///yemennet_dsl.db"
+    HTTP_PROXY: Optional[str] = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

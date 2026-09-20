@@ -41,9 +41,10 @@ def line_details_kb(line_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🔄 تحديث الخط الآن", callback_data=f"line_sync:{line_id}"),
-            InlineKeyboardButton(text="⚙️ تخصيص التنبيهات", callback_data=f"line_thresholds:{line_id}")
+            InlineKeyboardButton(text="🔐 تجديد الجلسة", callback_data=f"line_reauth:{line_id}")
         ],
         [
+            InlineKeyboardButton(text="⚙️ تخصيص التنبيهات", callback_data=f"line_thresholds:{line_id}"),
             InlineKeyboardButton(text="🗑️ حذف الخط", callback_data=f"line_delete_confirm:{line_id}")
         ],
         [
@@ -53,10 +54,12 @@ def line_details_kb(line_id: int) -> InlineKeyboardMarkup:
     ])
     return kb
 
-def cancel_fsm_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ إلغاء العملية", callback_data="btn_cancel_fsm")]
-    ])
+def cancel_fsm_kb(show_refresh_captcha: bool = False) -> InlineKeyboardMarkup:
+    buttons = []
+    if show_refresh_captcha:
+        buttons.append([InlineKeyboardButton(text="🔄 صورة كباتشا جديدة", callback_data="btn_refresh_captcha")])
+    buttons.append([InlineKeyboardButton(text="❌ إلغاء العملية", callback_data="btn_cancel_fsm")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def line_delete_confirm_kb(line_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[

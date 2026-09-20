@@ -93,6 +93,18 @@ docker-compose up -d --build
 
 ---
 
+## 📱 التشغيل على هواتف الأندرويد (Termux)
+
+لتشغيل البوت مباشرة على هاتفك الأندرويد داخل اليمن بأمر واحد:
+
+```bash
+pkg update -y && pkg install -y git && git clone https://github.com/devrabie/adsl-bot.git && cd adsl-bot && bash setup_termux.sh
+```
+
+للمزيد من التفاصيل والتعليمات، راجع [دليل Termux التفصيلي](README_TERMUX.md).
+
+---
+
 ## 🧪 إجراء الاختبارات (Testing)
 
 ```bash
