@@ -4,30 +4,35 @@
 #  YemenNet ADSL Monitor Bot - Termux Runner
 # ==========================================================
 
-# منع نظام الأندرويد من إيقاف التطبيق عند قفل الشاشة
-if command -v termux-wake-lock >/dev/null 2>&1; then
-    echo "🔒 تفعيل قفل الاستيقاظ (Wake Lock) لضمان استمرار البوت في الخلفية..."
-    termux-wake-lock
+# Preload Python runtime library to avoid Rust dlopen PyBaseObject_Type error
+if [ -f "$PREFIX/lib/libpython3.13.so" ]; then
+    export LD_PRELOAD=$PREFIX/lib/libpython3.13.so
 fi
 
-# تفعيل البيئة الافتراضية
+# Acquire Termux Wake-Lock to prevent Android from killing the bot in background
+if command -v termux-wake-lock >/dev/null 2>&1; then
+    echo "[*] Enabling Wake Lock for background running..."
+    termux-wake-lock 2>/dev/null || true
+fi
+
+# Activate Virtual Environment
 if [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
-# دالة التعامل مع الإغلاق
+# Cleanup handler on stop/exit
 cleanup() {
-    echo -e "\n🛑 يتم الآن إيقاف البوت..."
+    echo -e "\n[!] Stopping bot..."
     if command -v termux-wake-unlock >/dev/null 2>&1; then
-        termux-wake-unlock
-        echo "🔓 تم فك قفل الاستيقاظ (Wake Lock)."
+        termux-wake-unlock 2>/dev/null || true
+        echo "[*] Wake Lock released."
     fi
     exit 0
 }
 
 trap cleanup SIGINT SIGTERM
 
-echo "🚀 جاري تشغيل بوت مراقبة خطوط يمن نت..."
+echo "[>] Starting Yemen Net DSL Monitor Bot..."
 python main.py
 
 cleanup
