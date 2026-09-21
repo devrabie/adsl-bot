@@ -2,7 +2,6 @@
 
 # ==========================================================
 #  YemenNet ADSL Monitor Bot - Termux Auto Installer
-#  تثبيت وتشغيل بوت مراقبة خطوط يمن نت على تطبيق Termux
 # ==========================================================
 
 set -e
@@ -14,45 +13,60 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 echo -e "${CYAN}====================================================${NC}"
-echo -e "${GREEN}   🤖 بدء تثبيت بوت مراقبة خطوط يمن نت ADSL على Termux${NC}"
+echo -e "${GREEN}   [+] YemenNet ADSL Bot Installer for Termux       ${NC}"
 echo -e "${CYAN}====================================================${NC}"
 
-# 1. تحديث مستودعات تيرمكس
-echo -e "\n${YELLOW}[1/5] تحديث حزم النظام في Termux...${NC}"
-pkg update -y && pkg upgrade -y
+# 0. Telegram Credentials Prompt
+echo -e "\n${YELLOW}[Setup] Please enter your Telegram Bot credentials:${NC}"
 
-# 2. تثبيت الحزم والمترجمات اللازمة
-echo -e "\n${YELLOW}[2/5] تثبيت Python والحزم المساعدة والمكتبات...${NC}"
-pkg install -y python git clang libffi openssl libxml2 libxslt libjpeg-turbo freetype termux-api
+while true; do
+    read -p ">> Enter Bot Token: " BOT_TOKEN
+    if [ -n "$BOT_TOKEN" ]; then
+        break
+    else
+        echo -e "${RED}[!] Bot Token cannot be empty!${NC}"
+    fi
+done
 
-# 3. إعداد البيئة الافتراضية
-echo -e "\n${YELLOW}[3/5] إنشاء البيئة الافتراضية للبايثون...${NC}"
+while true; do
+    read -p ">> Enter Admin Telegram ID: " ADMIN_ID
+    if [ -n "$ADMIN_ID" ]; then
+        break
+    else
+        echo -e "${RED}[!] Admin ID cannot be empty!${NC}"
+    fi
+done
+
+# 1. Update Termux repositories
+echo -e "\n${YELLOW}[1/5] Updating Termux packages...${NC}"
+pkg update -y
+
+# 2. Install prebuilt system packages and Rust compiler tools
+echo -e "\n${YELLOW}[2/5] Installing Python, Rust & dependencies...${NC}"
+pkg install -y python git clang rust binutils libffi openssl libxml2 libxslt libjpeg-turbo freetype termux-api python-cryptography
+
+# Export libpython to memory to prevent PyBaseObject_Type symbol dlopen failure
+export LD_PRELOAD=$PREFIX/lib/libpython3.13.so
+
+# 3. Setup Virtual Environment linked with system packages
+echo -e "\n${YELLOW}[3/5] Setting up virtual environment...${NC}"
 if [ ! -d "venv" ]; then
-    python -m venv venv
+    python -m venv --system-site-packages venv
 fi
 
 source venv/bin/activate
-pip install --upgrade pip setuptools wheel
+pip install --upgrade pip setuptools wheel maturin
 
-# 4. تثبيت متطلبات المشروع
-echo -e "\n${YELLOW}[4/5] تثبيت مكتبات بايثون المطلوبة (قد يستغرق بضع دقائق)...${NC}"
-pip install -r requirements.txt
+# 4. Install requirements, tzdata for Aden timezone & Arabic BiDi text shapers
+echo -e "\n${YELLOW}[4/5] Installing project Python requirements...${NC}"
+pip install tzdata arabic-reshaper python-bidi
+pip install --no-build-isolation -r requirements.txt
 
-# 5. إعداد ملف البيئة .env
-echo -e "\n${YELLOW}[5/5] إعداد ملف الإعدادات (.env)...${NC}"
-if [ ! -f ".env" ]; then
-    # توليد مفتاح التشفير Fernet
-    FERNET_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+# 5. Generate Fernet Key and write .env
+echo -e "\n${YELLOW}[5/5] Writing configuration to .env...${NC}"
+FERNET_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
 
-    echo -e "${CYAN}يرجى إدخال إعدادات البوت (أو اضغط Enter للاعتماد الافتراضي):${NC}"
-    
-    read -p "توكن البوت (Bot Token) [8462164343:AAGljKn7vEiH4Wq39nTDFC3x0BIlSB1teXE]: " INPUT_TOKEN
-    BOT_TOKEN=${INPUT_TOKEN:-"8462164343:AAGljKn7vEiH4Wq39nTDFC3x0BIlSB1teXE"}
-
-    read -p "معرف التيليجرام للأدمن (Admin ID) [6198033039]: " INPUT_ADMIN
-    ADMIN_ID=${INPUT_ADMIN:-"6198033039"}
-
-    cat <<EOF > .env
+cat <<EOF > .env
 # Telegram Bot Configuration
 BOT_TOKEN=${BOT_TOKEN}
 
@@ -70,21 +84,23 @@ CHECK_INTERVAL_HOURS=4
 # Database URL
 DATABASE_URL=sqlite+aiosqlite:///yemennet_dsl.db
 EOF
-    echo -e "${GREEN}✅ تم إنشاء ملف .env بنجاح!${NC}"
-else
-    echo -e "${GREEN}ℹ️ ملف .env موجود بالفعل، تم تخطي الإنشاء.${NC}"
+echo -e "${GREEN}[OK] .env configuration generated!${NC}"
+
+# Database Initialization
+echo -e "\n${YELLOW}[*] Initializing local database...${NC}"
+python -c "import asyncio; from core.db import init_db; asyncio.run(init_db())"
+echo -e "${GREEN}[OK] Database initialized successfully!${NC}"
+
+# Ensure start script retains LD_PRELOAD
+if [ -f "start_termux.sh" ]; then
+    if ! grep -q "LD_PRELOAD" start_termux.sh; then
+        sed -i '2i export LD_PRELOAD=$PREFIX/lib/libpython3.13.so' start_termux.sh
+    fi
+    chmod +x start_termux.sh
 fi
 
-# تهيئة قاعدة البيانات
-echo -e "\n${YELLOW}🛠️ تهيئة قاعدة البيانات...${NC}"
-python -c "import asyncio; from core.db import init_db; asyncio.run(init_db())"
-echo -e "${GREEN}✅ تم تجهيز قاعدة البيانات بنجاح!${NC}"
-
-# إعطاء صلاحيات التشغيل لملف start_termux.sh
-chmod +x start_termux.sh || true
-
 echo -e "\n${CYAN}====================================================${NC}"
-echo -e "${GREEN}🎉 تم الانتهاء من التثبيت بنجاح!${NC}"
-echo -e "${CYAN}للتشغيل في أي وقت اكتب:${NC}"
+echo -e "${GREEN}[SUCCESS] Installation finished!${NC}"
+echo -e "${CYAN}Start the bot anytime using:${NC}"
 echo -e "   ${YELLOW}./start_termux.sh${NC}"
 echo -e "${CYAN}====================================================${NC}\n"
