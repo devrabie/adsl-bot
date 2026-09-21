@@ -45,8 +45,11 @@ pkg update -y
 echo -e "\n${YELLOW}[2/5] Installing Python, Rust & dependencies...${NC}"
 pkg install -y python git clang rust binutils libffi openssl libxml2 libxslt libjpeg-turbo freetype termux-api python-cryptography
 
-# Export libpython to memory to prevent PyBaseObject_Type symbol dlopen failure
-export LD_PRELOAD=$PREFIX/lib/libpython3.13.so
+# Resolve Python shared library path dynamically and export to LD_PRELOAD
+PY_SO=$(find "$PREFIX/lib" -maxdepth 1 -name "libpython3.*.so" | head -n 1)
+if [ -n "$PY_SO" ]; then
+    export LD_PRELOAD="$PY_SO"
+fi
 
 # 3. Setup Virtual Environment linked with system packages
 echo -e "\n${YELLOW}[3/5] Setting up virtual environment...${NC}"
@@ -54,12 +57,16 @@ if [ ! -d "venv" ]; then
     python -m venv --system-site-packages venv
 fi
 
+# Ensure all binaries in venv have executable permissions
+chmod +x ./venv/bin/* 2>/dev/null || true
+
 source venv/bin/activate
 pip install --upgrade pip setuptools wheel maturin
 
-# 4. Install requirements, tzdata for Aden timezone & Arabic BiDi text shapers
+# 4. Install requirements, tzdata for Aden timezone & Arabic text tools
 echo -e "\n${YELLOW}[4/5] Installing project Python requirements...${NC}"
-pip install tzdata arabic-reshaper python-bidi
+pip install tzdata arabic-reshaper
+pip install --no-build-isolation python-bidi || true
 pip install --no-build-isolation -r requirements.txt
 
 # 5. Generate Fernet Key and write .env
@@ -91,13 +98,8 @@ echo -e "\n${YELLOW}[*] Initializing local database...${NC}"
 python -c "import asyncio; from core.db import init_db; asyncio.run(init_db())"
 echo -e "${GREEN}[OK] Database initialized successfully!${NC}"
 
-# Ensure start script retains LD_PRELOAD
-if [ -f "start_termux.sh" ]; then
-    if ! grep -q "LD_PRELOAD" start_termux.sh; then
-        sed -i '2i export LD_PRELOAD=$PREFIX/lib/libpython3.13.so' start_termux.sh
-    fi
-    chmod +x start_termux.sh
-fi
+# Ensure start script has executable rights
+chmod +x start_termux.sh 2>/dev/null || true
 
 echo -e "\n${CYAN}====================================================${NC}"
 echo -e "${GREEN}[SUCCESS] Installation finished!${NC}"
